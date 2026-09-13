@@ -26,8 +26,9 @@
  */
 
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import {
+  getMediaCommentsCount,
   getRecentMediaComments,
   getUserMedia,
   MetaApiError,
@@ -48,13 +49,32 @@ const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
 // For "any post" campaigns, how many recent posts to scan.
 const RECENT_MEDIA_LIMIT = 10;
 
+// How long to remember a media's last-seen comments_count, so a sweep days
+// later doesn't wrongly compare against a stale baseline.
+const COMMENTS_COUNT_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+interface MediaCheck {
+  mediaId: string;
+  apiReturned: number;
+  commentsCount: number | null;
+  suspectedHidden: boolean;
+}
+
 interface SweepStat {
   campaign: string;
   keywords: string;
   matched: number;
   alreadyReplied: number;
+  // Comment matched and already fully handled (DM sent, reply posted if
+  // enabled) by an earlier sweep or the webhook path — not an error, just not
+  // new work.
+  alreadyHandled: number;
+  // Matched, not yet handled, but dropped by MAX_NEW_PER_SWEEP this pass. It
+  // will be picked up on a later sweep.
+  capped: number;
   enqueued: number;
   errors: string[];
+  media: MediaCheck[];
 }
 
 function errMessage(error: unknown): string {
@@ -62,6 +82,24 @@ function errMessage(error: unknown): string {
     return `Meta ${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
   return "Unknown error";
+}
+
+/**
+ * Records a media's current comments_count and reports whether it grew since
+ * the last sweep. Used to distinguish "nothing new" from "Instagram is
+ * hiding something" — see the module doc comment.
+ */
+async function trackCommentsCount(
+  mediaId: string,
+  current: number | null
+): Promise<{ grew: boolean }> {
+  if (current === null) return { grew: false };
+  const redis = getRedisConnection();
+  const key = `commentPoll:lastCount:${mediaId}`;
+  const previousRaw = await redis.get(key);
+  await redis.set(key, String(current), "EX", COMMENTS_COUNT_TTL_SECONDS);
+  const previous = previousRaw === null ? null : Number(previousRaw);
+  return { grew: previous !== null && current > previous };
 }
 
 /** One reconciliation pass across every active campaign. */
@@ -106,8 +144,11 @@ export async function reconcileComments(): Promise<void> {
         keywords: automation.keywords.join(","),
         matched: 0,
         alreadyReplied: 0,
+        alreadyHandled: 0,
+        capped: 0,
         enqueued: 0,
         errors: [errMessage(error)],
+        media: [],
       })
     );
     await recordSweep(automation.workspaceId, stat);
@@ -149,8 +190,11 @@ async function sweepCampaign({
       : automation.keywords.join(","),
     matched: 0,
     alreadyReplied: 0,
+    alreadyHandled: 0,
+    capped: 0,
     enqueued: 0,
     errors: [],
+    media: [],
   };
 
   // Decrypt the account token once per sweep.
@@ -171,6 +215,9 @@ async function sweepCampaign({
   // Which media this campaign covers: its own post, or the recent feed if it
   // matches any post.
   const mediaIds: string[] = [];
+  // comments_count comes free with getUserMedia's fields; keyed here so the
+  // per-media loop below can use it without an extra request.
+  const commentsCountByMedia = new Map<string, number | null>();
   if (automation.postId) {
     mediaIds.push(automation.postId);
     mediaIds.push(...(await adMediaFor(automation.postId)));
@@ -181,6 +228,7 @@ async function sweepCampaign({
         limit: RECENT_MEDIA_LIMIT,
       });
       mediaIds.push(...media.map((m) => m.id));
+      for (const m of media) commentsCountByMedia.set(m.id, m.comments_count ?? null);
     } catch (error) {
       stat.errors.push(`Media list: ${errMessage(error)}`);
     }
@@ -201,6 +249,27 @@ async function sweepCampaign({
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
     }
+
+    // Diagnostic only, never fatal: compare Instagram's own comment count
+    // against what the API just handed back. A count that grew while the API
+    // returned nothing is the signature of Instagram silently hiding
+    // comments (Hidden Words / spam filter) rather than there being nothing
+    // new — see the module doc comment. Bounded to the campaign's own post so
+    // a single extra request per sweep, not one per ad-copy/media-id.
+    const commentsCount =
+      commentsCountByMedia.get(mediaId) ??
+      (mediaId === automation.postId
+        ? await getMediaCommentsCount({ context: accessToken, mediaId }).catch(
+            () => null
+          )
+        : null);
+    const { grew } = await trackCommentsCount(mediaId, commentsCount);
+    stat.media.push({
+      mediaId,
+      apiReturned: comments.length,
+      commentsCount,
+      suspectedHidden: grew && comments.length === 0,
+    });
 
     // Keep only comments that (a) aren't the account's own, (b) match the
     // keyword, and (c) have no reply from the account owner yet.
@@ -247,12 +316,14 @@ async function sweepCampaign({
       select: { commentId: true },
     });
     const handledSet = new Set(handled.map((h) => h.commentId));
+    stat.alreadyHandled += handledSet.size;
 
     // Oldest first, so whoever commented earliest gets answered first, capped.
-    const fresh = needsAction
-      .filter((c) => !handledSet.has(c.id))
+    const notYetHandled = needsAction.filter((c) => !handledSet.has(c.id));
+    const fresh = notYetHandled
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
       .slice(0, MAX_NEW_PER_SWEEP);
+    stat.capped += notYetHandled.length - fresh.length;
 
     for (const c of fresh) {
       // No deterministic jobId here: a retained completed/failed job from an
@@ -324,17 +395,39 @@ async function recordSweep(
   workspaceId: string,
   stat: SweepStat
 ): Promise<void> {
-  // Only log when something happened or something went wrong.
-  if (stat.enqueued === 0 && stat.errors.length === 0) return;
+  const suspects = stat.media.filter((m) => m.suspectedHidden);
+
+  // Only log when something happened, something went wrong, or Instagram
+  // looks like it's hiding comments from us — a silent "0 found" sweep with
+  // nothing suspicious isn't worth a row.
+  const noteworthy =
+    stat.enqueued > 0 ||
+    stat.matched > 0 ||
+    stat.errors.length > 0 ||
+    suspects.length > 0;
+  if (!noteworthy) return;
+
+  const level =
+    stat.errors.length > 0 || suspects.length > 0 ? "WARNING" : "INFO";
+  const suspectNote = suspects.length
+    ? ` — POSSIBLE INSTAGRAM COMMENT HIDING: ${suspects
+        .map(
+          (m) =>
+            `media ${m.mediaId} comments_count rose to ${m.commentsCount} but the API returned 0 comments`
+        )
+        .join("; ")}`
+    : "";
 
   await prisma.operationalEvent
     .create({
       data: {
         workspaceId,
         source: "SYSTEM",
-        level: stat.errors.length > 0 ? "WARNING" : "INFO",
-        message: `Comment sweep "${stat.campaign}" [${stat.keywords}]: ${stat.enqueued} enqueued, ${stat.matched} matched, ${stat.alreadyReplied} already replied`,
-        payload: { ...stat },
+        level,
+        message: `Comment sweep "${stat.campaign}" [${stat.keywords}]: ${stat.enqueued} enqueued, ${stat.matched} matched, ${stat.alreadyReplied} already replied, ${stat.alreadyHandled} already handled${stat.capped ? `, ${stat.capped} capped` : ""}${suspectNote}`,
+        // Prisma's Json input type doesn't structurally accept the SweepStat
+        // interface directly; round-tripping guarantees a plain JSON value.
+        payload: JSON.parse(JSON.stringify(stat)),
       },
     })
     .catch(() => {});

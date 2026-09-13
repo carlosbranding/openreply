@@ -62,6 +62,22 @@ export async function getRecentMediaComments({
     .slice(0, max);
 }
 
+/**
+ * Diagnostic-only total comment count for a media, straight from the Graph
+ * API — not available through Zernio, so callers must treat `null` as "not
+ * known" rather than "zero".
+ */
+export async function getMediaCommentsCount({
+  context,
+  mediaId,
+}: {
+  context: InstagramContext;
+  mediaId: string;
+}): Promise<number | null> {
+  if (context.provider !== "META") return null;
+  return meta.getMediaCommentsCount(context.accessToken, mediaId);
+}
+
 export async function getUserMedia({
   context,
   limit = 25,

@@ -484,6 +484,26 @@ export async function getRecentMediaComments(
     .slice(0, max);
 }
 
+/**
+ * A media's total comment count, straight from Instagram — independent of the
+ * (windowed, filterable) `/comments` edge above. Diagnostic-only: the polling
+ * reconciler compares this against what `/comments` actually returns to spot
+ * Instagram silently hiding comments (Hidden Words / spam filter) rather than
+ * there simply being nothing new.
+ */
+export async function getMediaCommentsCount(
+  accessToken: string,
+  mediaId: string
+): Promise<number | null> {
+  const url = new URL(`${instagramGraphBase()}/${mediaId}`);
+  url.searchParams.set("fields", "comments_count");
+  url.searchParams.set("access_token", accessToken);
+
+  const response = await fetch(url.toString());
+  const data = await handleResponse<{ comments_count?: number }>(response);
+  return typeof data.comments_count === "number" ? data.comments_count : null;
+}
+
 // --- Direct message inbox (Conversations API) ---------------------------
 
 export interface InstagramParticipant {
